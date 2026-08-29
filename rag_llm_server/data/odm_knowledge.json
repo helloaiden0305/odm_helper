@@ -1,0 +1,142 @@
+[
+  {
+    "id": "doc_001",
+    "title": "X100 蓝牙连接失败排查 SOP",
+    "content": "当 X100 出现蓝牙连接失败或蓝牙连不上时，优先确认 bt_stack 日志、复现时间点、车机型号和手机系统版本。排查顺序为重启蓝牙、清除配对记录、抓取日志、确认是否进入低功耗状态。",
+    "metadata": {
+      "doc_type": "排查 SOP",
+      "project": "X100",
+      "module": "蓝牙"
+    }
+  },
+  {
+    "id": "doc_002",
+    "title": "X100 蓝牙配对异常历史缺陷",
+    "content": "历史缺陷 X100-BT-214 显示，部分软件版本在快速重复配对时会残留旧 link key，导致配对失败。处理建议是升级到修复版本，或清除车机和手机两侧配对记录后重新配对。",
+    "metadata": {
+      "doc_type": "历史缺陷",
+      "project": "X100",
+      "module": "蓝牙"
+    }
+  },
+  {
+    "id": "doc_003",
+    "title": "X100 车机蓝牙通话无声定位",
+    "content": "蓝牙通话无声需要同步检查 HFP 连接状态、音频路由、麦克风权限和 audio policy 日志。复现时记录通话建立时间、手机型号、车机软件版本和是否连接多个蓝牙设备。",
+    "metadata": {
+      "doc_type": "故障案例",
+      "project": "X100",
+      "module": "蓝牙"
+    }
+  },
+  {
+    "id": "doc_004",
+    "title": "Wi-Fi 断连日志抓取 SOP",
+    "content": "Wi-Fi 断连问题需要同时抓取 kernel log、wpa_supplicant log 和路由器侧日志。记录断连时间点、RSSI、信道、加密方式和是否发生漫游。",
+    "metadata": {
+      "doc_type": "排查 SOP",
+      "project": "通用",
+      "module": "Wi-Fi"
+    }
+  },
+  {
+    "id": "doc_005",
+    "title": "Wi-Fi 低功耗导致连接异常",
+    "content": "待机唤醒后 Wi-Fi 连接异常时，需要确认省电策略是否关闭扫描或暂停 DHCP 续租。重点检查 suspend/resume 日志、wlan driver 日志和网络恢复耗时。",
+    "metadata": {
+      "doc_type": "故障案例",
+      "project": "通用",
+      "module": "Wi-Fi"
+    }
+  },
+  {
+    "id": "doc_006",
+    "title": "刷机失败卡在 fastboot 排查流程",
+    "content": "刷机失败卡在 fastboot 时，先确认 USB 线材、驱动、设备是否被 fastboot devices 识别，再核对镜像版本、分区表和解锁状态。保留刷机工具日志和串口日志。",
+    "metadata": {
+      "doc_type": "排查 SOP",
+      "project": "通用",
+      "module": "系统升级"
+    }
+  },
+  {
+    "id": "doc_007",
+    "title": "系统升级失败问题定位",
+    "content": "OTA 或本地升级失败需要收集升级包版本、当前版本、升级方式、错误码、recovery log 和 update_engine 日志。先确认包完整性和版本路径是否允许。",
+    "metadata": {
+      "doc_type": "日志分析方法",
+      "project": "通用",
+      "module": "系统升级"
+    }
+  },
+  {
+    "id": "doc_008",
+    "title": "ANR 问题日志分析",
+    "content": "ANR 问题至少需要收集 traces.txt、main log、system log、event log、CPU 负载和复现步骤。分析时先看发生进程、阻塞线程、锁等待和 Binder 调用链。",
+    "metadata": {
+      "doc_type": "日志分析方法",
+      "project": "通用",
+      "module": "性能稳定性"
+    }
+  },
+  {
+    "id": "doc_009",
+    "title": "性能卡顿日志分析",
+    "content": "性能卡顿需要记录场景、操作路径、屏幕录制、systrace 或 perfetto、CPU/内存占用和关键帧耗时。优先区分 UI 主线程阻塞、I/O 等待和后台服务抢占。",
+    "metadata": {
+      "doc_type": "日志分析方法",
+      "project": "通用",
+      "module": "性能稳定性"
+    }
+  },
+  {
+    "id": "doc_010",
+    "title": "相机预览黑屏排查",
+    "content": "相机预览黑屏时，检查摄像头权限、CameraService 日志、HAL 初始化、Surface 创建和预览流格式。若是偶发问题，需要记录冷热启动、切前后台和多应用占用情况。",
+    "metadata": {
+      "doc_type": "故障案例",
+      "project": "通用",
+      "module": "相机"
+    }
+  },
+  {
+    "id": "doc_011",
+    "title": "音频无声问题排查",
+    "content": "音频无声需要确认音量、静音状态、音频焦点、输出设备路由和 codec 状态。收集 audioflinger、audioserver、kernel audio 日志，并标注复现时间点。",
+    "metadata": {
+      "doc_type": "故障案例",
+      "project": "通用",
+      "module": "音频"
+    }
+  },
+  {
+    "id": "doc_012",
+    "title": "测试报告提交规范",
+    "content": "测试报告提交前需要确认版本号、测试范围、测试环境、通过率、阻塞问题、遗留风险和附件日志完整。所有未关闭缺陷需要标注责任人、计划修复版本和回归状态。",
+    "metadata": {
+      "doc_type": "测试规范",
+      "project": "通用",
+      "module": "测试管理"
+    }
+  },
+  {
+    "id": "doc_013",
+    "title": "Bug 回归验证模板",
+    "content": "Bug 回归记录应包含缺陷 ID、修复版本、验证环境、复现步骤、预期结果、实际结果、验证结论和关联日志。若无法复现，需要说明样本量和验证次数。",
+    "metadata": {
+      "doc_type": "测试规范",
+      "project": "通用",
+      "module": "测试管理"
+    }
+  },
+  {
+    "id": "doc_014",
+    "title": "问题单信息收集要求",
+    "content": "提交问题单时至少提供项目名、设备型号、软件版本、问题模块、复现概率、复现步骤、日志附件和影响范围。信息不足时应先补充事实，不直接给定根因。",
+    "metadata": {
+      "doc_type": "测试规范",
+      "project": "通用",
+      "module": "问题管理"
+    }
+  }
+]

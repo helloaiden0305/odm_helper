@@ -1,0 +1,85 @@
+/**
+ * Copyright 2025 Beijing Volcano Engine Technology Co., Ltd. All Rights Reserved.
+ * SPDX-license-identifier: BSD-3-Clause
+ */
+
+.card {
+  position: relative;
+  text-align: center;
+  text-align: center;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+
+  .avatar {
+    img {
+      width: 128px;
+      height: 128px;
+    }
+    border-radius: 50%;
+    width: 128px;
+    height: 128px;
+    background: linear-gradient(180deg, #d7f5f0 0%, #9ed7cc 100%);
+    box-shadow: 0 12px 36px rgba(12, 76, 68, 0.16);
+  }
+
+  .title {
+    font-weight: 500;
+    font-size: 24px;
+    line-height: 32px;
+    color: #102a37;
+  }
+
+  .desc {
+    margin-top: 8px;
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 22px;
+    color: #53666f;
+  }
+
+  .examples {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    max-width: 760px;
+
+    span {
+      padding: 6px 10px;
+      border: 1px solid #c9ddd8;
+      border-radius: 4px;
+      background: #f6faf9;
+      color: #2b4a55;
+      font-size: 12px;
+      line-height: 18px;
+      white-space: nowrap;
+    }
+  }
+
+  .exceededTitle {
+    font-weight: 500;
+    font-size: 24px;
+    line-height: 32px;
+    background: linear-gradient(77.86deg, #0f6171 -3.23%, #12856f 51.11%, #4f8f3a 98.65%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    cursor: pointer;
+    img {
+      margin-left: 4px;
+    }
+  }
+
+  .sceneContainer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    width: max-content;
+    max-width: 100%;
+  }
+}
