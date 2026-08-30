@@ -22,6 +22,17 @@ class Config:
     ASR_APP_ID = os.getenv("ASR_APP_ID")
     TTS_APP_ID = os.getenv("TTS_APP_ID")
     TTS_SPEED_RATIO = float(os.getenv("TTS_SPEED_RATIO", "1.5"))
+
+    CONTEXT_MANAGER_ENABLED = os.getenv("CONTEXT_MANAGER_ENABLED", "true").lower() == "true"
+    CONTEXT_BUDGET_TOKENS = int(os.getenv("CONTEXT_BUDGET_TOKENS", "6000"))
+    CONTEXT_T2_THRESHOLD = float(os.getenv("CONTEXT_T2_THRESHOLD", "0.50"))
+    CONTEXT_T3_THRESHOLD = float(os.getenv("CONTEXT_T3_THRESHOLD", "0.75"))
+    CONTEXT_T4_THRESHOLD = float(os.getenv("CONTEXT_T4_THRESHOLD", "0.90"))
+    CONTEXT_T5_THRESHOLD = float(os.getenv("CONTEXT_T5_THRESHOLD", "0.95"))
+    CONTEXT_RECENT_ROUNDS = int(os.getenv("CONTEXT_RECENT_ROUNDS", "6"))
+    CONTEXT_MAX_MESSAGE_CHARS = int(os.getenv("CONTEXT_MAX_MESSAGE_CHARS", "1200"))
+    CONTEXT_SESSION_ID = os.getenv("CONTEXT_SESSION_ID", "text_default")
+    CONTEXT_DEMO_MODE = os.getenv("CONTEXT_DEMO_MODE", "false").lower() == "true"
     
     SERVER_URL = os.getenv("SERVER_URL")
 

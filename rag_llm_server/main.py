@@ -17,6 +17,7 @@ from services.llm_service import llm_service
 from services.session_store import session_store
 from services.token_build import AccessToken, PRIVILEGES
 from services.utils import Signer  # 确保 utils.py 已移动到 services 目录
+from services.context_manager import context_manager
 
 from fastapi.responses import JSONResponse
 
@@ -552,6 +553,7 @@ class ChatMessage(BaseModel):
 class DebugRequest(BaseModel):
     history: Optional[List[ChatMessage]] = []
     question: str
+    session_id: Optional[str] = None
 
 
 class ConfirmVoiceQuestionRequest(BaseModel):
@@ -614,21 +616,21 @@ async def text_chat_stream(request: DebugRequest):
     if not question:
         return StreamingResponse(iter([""]), media_type="text/plain; charset=utf-8")
 
-    current_messages = []
+    history_messages = []
     for msg in request.history or []:
-        current_messages.append({"role": msg.role, "content": msg.content})
-
-    current_messages.append({"role": "user", "content": question})
+        history_messages.append({"role": msg.role, "content": msg.content})
 
     request_start = time.time()
+    session_id = request.session_id or settings.CONTEXT_SESSION_ID
     print(
         f"DEBUG: [{trace_id}] 文字流式请求开始 "
-        f"question_len={len(question)}, history_count={len(request.history or [])}"
+        f"session_id={session_id}, question_len={len(question)}, history_count={len(request.history or [])}"
     )
 
     async def generate_text_stream():
         output_chars = 0
         first_chunk_sent = False
+        answer_parts: list[str] = []
 
         try:
             rag_start = time.time()
@@ -636,7 +638,16 @@ async def text_chat_stream(request: DebugRequest):
             rag_duration = time.time() - rag_start
             print(f"DEBUG: [{trace_id}] 文字流式知识库查询耗时: {rag_duration:.2f}s")
 
-            stream = llm_service.chat_stream(current_messages, rag_content)
+            context_result = context_manager.build_context(
+                session_id=session_id,
+                history=history_messages,
+                question=question,
+                rag_context=rag_content,
+                trace_id=trace_id,
+                system_prompt=SYSTEM_PROMPT,
+            )
+
+            stream = llm_service.chat_stream(context_result.messages, context_result.rag_context)
             for chunk in stream:
                 choices = getattr(chunk, "choices", None)
                 if not choices:
@@ -653,11 +664,18 @@ async def text_chat_stream(request: DebugRequest):
                     print(f"DEBUG: [{trace_id}] 文字流式首 chunk 耗时: {first_chunk_duration:.2f}s")
 
                 output_chars += len(content)
+                answer_parts.append(content)
                 yield content
         except Exception as exc:
             print(f"ERROR: [{trace_id}] 文字流式输出失败: {exc}")
             yield "助手暂时没有返回，请稍后重试。"
         finally:
+            context_manager.record_exchange(
+                session_id=session_id,
+                question=question,
+                answer="".join(answer_parts),
+                trace_id=trace_id,
+            )
             total_duration = time.time() - request_start
             print(
                 f"DEBUG: [{trace_id}] 文字流式请求结束 "
