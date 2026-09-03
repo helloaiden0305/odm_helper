@@ -477,6 +477,11 @@ async def chat_callback(request: Request):
 
     latest_user_text = (messages[-1].get("content") or "").strip()
     is_welcome_message = latest_user_text == "欢迎语"
+    input_limit_message = context_manager.input_limit_message(latest_user_text)
+    if input_limit_message and not is_welcome_message:
+        print(f"WARN: [{preview_id}] 语音输入预检拦截 text_len={len(latest_user_text)}")
+        return JSONResponse(status_code=413, content={"text": input_limit_message})
+
     voice_turn_id = consume_confirmed_voice_question(session_key, latest_user_text)
     if settings.VOICE_CONFIRM_MODE and session_key and not is_welcome_message and not voice_turn_id:
         print(
@@ -518,12 +523,22 @@ async def chat_callback(request: Request):
         stream_succeeded = False
 
         try:
-            rag_content = await rag_service.retrieve(latest_user_text)
-            context_result = context_manager.build_context(
-                session_id=context_session_id,
-                history=messages[:-1],
+            rag_started_at = time.time()
+            rag_task = asyncio.create_task(rag_service.retrieve(latest_user_text))
+            context_task = asyncio.create_task(
+                asyncio.to_thread(
+                    context_manager.read_context,
+                    session_id=context_session_id,
+                    history=messages[:-1],
+                    turn_id=voice_turn_id,
+                    trace_id=preview_id,
+                )
+            )
+            rag_content, context_read = await asyncio.gather(rag_task, context_task)
+            print(f"DEBUG: [{preview_id}] 语音 RAG 与 Context Read 并行耗时: {time.time() - rag_started_at:.2f}s")
+            context_result = context_manager.build_prompt(
+                context_read=context_read,
                 question=latest_user_text,
-                turn_id=voice_turn_id,
                 rag_context=rag_content,
                 trace_id=preview_id,
                 system_prompt=SYSTEM_PROMPT,
@@ -577,11 +592,13 @@ async def chat_callback(request: Request):
         finally:
             try:
                 if voice_turn_id and stream_succeeded:
-                    context_manager.complete_turn(
-                        session_id=context_session_id,
-                        turn_id=voice_turn_id,
-                        answer="".join(answer_parts),
-                        trace_id=preview_id,
+                    asyncio.create_task(
+                        context_manager.complete_turn_async(
+                            session_id=context_session_id,
+                            turn_id=voice_turn_id,
+                            answer="".join(answer_parts),
+                            trace_id=preview_id,
+                        )
                     )
                 elif voice_turn_id:
                     context_manager.close_turn(
@@ -638,6 +655,10 @@ async def confirm_voice_question(request: ConfirmVoiceQuestionRequest):
             status_code=400,
             content={"ok": False, "message": "room_id、user_id 和 question 不能为空"},
         )
+
+    input_limit_message = context_manager.input_limit_message(question)
+    if input_limit_message:
+        return JSONResponse(status_code=413, content={"ok": False, "message": input_limit_message})
 
     session_key = build_session_key(request.room_id, request.user_id)
     conversation_id = session_store.get_conversation_id(request.room_id, request.user_id)
@@ -698,6 +719,11 @@ async def text_chat_stream(request: DebugRequest):
     if not question:
         return StreamingResponse(iter([""]), media_type="text/plain; charset=utf-8")
 
+    input_limit_message = context_manager.input_limit_message(question)
+    if input_limit_message:
+        print(f"WARN: [{trace_id}] 文字输入预检拦截 question_len={len(question)}")
+        return StreamingResponse(iter([input_limit_message]), media_type="text/plain; charset=utf-8")
+
     history_messages = []
     for msg in request.history or []:
         history_messages.append({"role": msg.role, "content": msg.content})
@@ -723,16 +749,25 @@ async def text_chat_stream(request: DebugRequest):
         stream_succeeded = False
 
         try:
-            rag_start = time.time()
-            rag_content = await rag_service.retrieve(question)
-            rag_duration = time.time() - rag_start
-            print(f"DEBUG: [{trace_id}] 文字流式知识库查询耗时: {rag_duration:.2f}s")
-
-            context_result = context_manager.build_context(
-                session_id=session_id,
-                history=history_messages,
+            parallel_started_at = time.time()
+            rag_task = asyncio.create_task(rag_service.retrieve(question))
+            context_task = asyncio.create_task(
+                asyncio.to_thread(
+                    context_manager.read_context,
+                    session_id=session_id,
+                    history=history_messages,
+                    turn_id=turn_id,
+                    trace_id=trace_id,
+                )
+            )
+            rag_content, context_read = await asyncio.gather(rag_task, context_task)
+            print(
+                f"DEBUG: [{trace_id}] 文字 RAG 与 Context Read 并行耗时: "
+                f"{time.time() - parallel_started_at:.2f}s"
+            )
+            context_result = context_manager.build_prompt(
+                context_read=context_read,
                 question=question,
-                turn_id=turn_id,
                 rag_context=rag_content,
                 trace_id=trace_id,
                 system_prompt=SYSTEM_PROMPT,
@@ -772,11 +807,13 @@ async def text_chat_stream(request: DebugRequest):
             yield "助手暂时没有返回，请稍后重试。"
         finally:
             if turn_id and stream_succeeded:
-                context_manager.complete_turn(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    answer="".join(answer_parts),
-                    trace_id=trace_id,
+                asyncio.create_task(
+                    context_manager.complete_turn_async(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        answer="".join(answer_parts),
+                        trace_id=trace_id,
+                    )
                 )
             elif turn_id:
                 context_manager.close_turn(

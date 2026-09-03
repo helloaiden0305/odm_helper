@@ -1,3 +1,4 @@
+import asyncio
 import math
 import re
 import uuid
@@ -12,6 +13,7 @@ from services.context_store import (
     context_store,
     now_iso,
 )
+from services.storage_mock import log_mock_storage
 
 
 LOADING_TEXTS = {
@@ -70,6 +72,12 @@ ERROR_CODE_PATTERN = re.compile(r"\b(?:ERR|ERROR|E|0x)[A-Za-z0-9_-]{2,}\b", re.I
 class ContextBuildResult:
     messages: list[dict[str, str]]
     rag_context: str
+    stats: dict[str, Any]
+
+
+@dataclass
+class ContextReadResult:
+    messages: list[dict[str, str]]
     stats: dict[str, Any]
 
 
@@ -318,28 +326,26 @@ def _build_nine_section_summary(
     )
 
 
-def _build_context_note(session_id: str) -> str:
-    parts: list[str] = []
-    session_summary = context_store.get_session_summary(session_id)
-    collapse_summaries = context_store.get_collapse_summaries(session_id)
-    facts = context_store.get_facts(session_id)
+SUMMARY_MARKER_PATTERN = re.compile(r"^\[\[summary_id:([^\]]+)\]\]$")
 
-    if session_summary:
-        parts.append(f"### T4 全量九段结构化摘要\n{session_summary.summary}")
-    elif collapse_summaries:
-        latest_collapse = collapse_summaries[-1]
-        parts.append(f"### T3 旧片段折叠摘要\n{latest_collapse.summary}")
 
-    if facts:
-        parts.append("### 关键事实\n" + "\n".join(_fact_lines(facts)))
+def _summary_marker_id(content: str) -> str:
+    matched = SUMMARY_MARKER_PATTERN.match((content or "").strip())
+    return matched.group(1) if matched else ""
 
-    if not parts:
-        return ""
 
-    return "以下是后端上下文压缩层提供的历史摘要和关键事实，请结合本轮问题与 RAG 内容回答，不要编造未出现的信息。\n\n" + "\n\n".join(parts)
+def _summary_message(summary: SummaryRecord) -> dict[str, str]:
+    label = "T4 九段结构化摘要" if summary.summary_type == "odm_9_sections" else "T3 旧片段折叠摘要"
+    return {"role": "system", "content": f"### {label}\n{summary.summary}"}
 
 
 class ContextManager:
+    def input_limit_message(self, question: str) -> str:
+        tokens = estimate_tokens(_normalize_content(question))
+        if tokens <= settings.CONTEXT_MAX_INPUT_TOKENS:
+            return ""
+        return "当前输入内容过长；如需分析 Android Log，请切换至 Log 分析模式上传或粘贴日志。"
+
     def begin_turn(self, *, session_id: str, question: str, channel: str, trace_id: str) -> str:
         if not settings.CONTEXT_MANAGER_ENABLED:
             return ""
@@ -363,14 +369,25 @@ class ContextManager:
         )
         return turn_id
 
+    async def complete_turn_async(self, *, session_id: str, turn_id: str, answer: str, trace_id: str) -> None:
+        """Run persistence and governance after the streaming response has completed."""
+        await asyncio.sleep(0)
+        try:
+            await asyncio.to_thread(
+                self.complete_turn,
+                session_id=session_id,
+                turn_id=turn_id,
+                answer=answer,
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            print(f"WARN: [{trace_id}] context_background_governance_failed: {exc}")
+
     def complete_turn(self, *, session_id: str, turn_id: str, answer: str, trace_id: str) -> None:
         if not settings.CONTEXT_MANAGER_ENABLED or not turn_id:
             return
 
-        cleaned_answer = _truncate_content(
-            _normalize_content(answer),
-            settings.CONTEXT_MAX_MESSAGE_CHARS,
-        )
+        cleaned_answer = _normalize_content(answer)
         completed_turns = context_store.complete_turn(session_id, turn_id, cleaned_answer)
         if not completed_turns:
             return
@@ -382,6 +399,15 @@ class ContextManager:
             f"session_id={session_id} turn_id={turn_id} answer_chars={len(cleaned_answer)} "
             f"answer_tokens={output_tokens} facts_added={facts_added}"
         )
+        log_mock_storage(
+            target="postgresql",
+            operation="persist_conversation_turns",
+            session_id=session_id,
+            trace_id=trace_id,
+            detail=f"turn_id={turn_id}, answer_chars={len(cleaned_answer)}",
+        )
+        print(f"DEBUG: [{trace_id}] 已落入 Mock PostgreSQL 会话表 session_id={session_id}")
+        self._govern_completed_history(session_id=session_id, trace_id=trace_id)
 
     def close_turn(self, *, session_id: str, turn_id: str, status: str, trace_id: str) -> None:
         if not settings.CONTEXT_MANAGER_ENABLED or not turn_id:
@@ -393,23 +419,18 @@ class ContextManager:
                 f"session_id={session_id} turn_id={turn_id}"
             )
 
-    def build_context(
+    def read_context(
         self,
         *,
         session_id: str,
         history: list[dict[str, Any]],
-        question: str,
         turn_id: str = "",
-        rag_context: str,
         trace_id: str,
-        system_prompt: str = "",
-    ) -> ContextBuildResult:
+    ) -> ContextReadResult:
         if not settings.CONTEXT_MANAGER_ENABLED:
-            messages = _clean_messages(history) + [{"role": "user", "content": question}]
-            return ContextBuildResult(messages=messages, rag_context=rag_context, stats={"enabled": False})
+            return ContextReadResult(messages=_clean_messages(history), stats={"enabled": False})
 
         incoming_history = _clean_messages(history)
-        cleaned_question = _truncate_content(_normalize_content(question), settings.CONTEXT_MAX_MESSAGE_CHARS)
         stored_current_turn = next(
             (
                 turn
@@ -418,9 +439,6 @@ class ContextManager:
             ),
             None,
         )
-        if stored_current_turn and stored_current_turn.content != cleaned_question:
-            stored_current_turn = None
-
         active_history_turns = [
             turn
             for turn in context_store.get_active_turns(session_id)
@@ -453,189 +471,252 @@ class ContextManager:
                 f"session_id={session_id} ignored_carrier_messages={len(incoming_history)}"
             )
 
-        cleaned_history = _turns_to_messages(active_history_turns)
-        question_message = (
-            {"role": stored_current_turn.role, "content": stored_current_turn.content}
-            if stored_current_turn
-            else {"role": "user", "content": cleaned_question}
-        )
-        all_messages = cleaned_history + [question_message]
-        tokens_before = estimate_tokens(
-            "\n".join([system_prompt, rag_context, *[message["content"] for message in all_messages]])
-        )
-        ratio_before = _safe_ratio(tokens_before)
-        print(
-            f"DEBUG: [{trace_id}] context_budget start "
-            f"session_id={session_id} history_in={len(cleaned_history)} "
-            f"tokens_before={tokens_before} budget={settings.CONTEXT_BUDGET_TOKENS} "
-            f"ratio={ratio_before:.2f}"
-        )
+        resolved_messages: list[dict[str, str]] = []
+        marker_ids: list[str] = []
+        for turn in active_history_turns:
+            summary_id = _summary_marker_id(turn.content)
+            if not summary_id:
+                resolved_messages.append({"role": turn.role, "content": turn.content})
+                continue
 
-        layers = ["T1"]
-        reason = "under_budget"
-        max_recent_messages = max(settings.CONTEXT_RECENT_ROUNDS * 2, 2)
-        should_t2 = len(cleaned_history) > max_recent_messages or ratio_before >= settings.CONTEXT_T2_THRESHOLD
-        old_messages: list[dict[str, str]] = []
-        recent_messages = cleaned_history
-        archived_turns = 0
-
-        recent_history_turns = active_history_turns
-        if should_t2 and len(cleaned_history) > max_recent_messages:
-            old_messages = cleaned_history[:-max_recent_messages]
-            recent_messages = cleaned_history[-max_recent_messages:]
-            old_turns = active_history_turns[:-max_recent_messages]
-            recent_history_turns = active_history_turns[-max_recent_messages:]
-            archive = context_store.archive_turns(
-                session_id=session_id,
-                turns=old_turns,
-                keywords=_extract_keywords("\n".join(message["content"] for message in old_messages)),
-            )
-            archived_turns = len(archive.turn_ids) if archive else 0
-            context_store.set_active_turns(
-                session_id,
-                recent_history_turns + ([stored_current_turn] if stored_current_turn else []),
-            )
-            layers.append("T2")
-            reason = "recent_rounds_exceeded"
-
-        facts_added = context_store.upsert_facts(
-            session_id,
-            _extract_facts(session_id, recent_history_turns),
-        )
-        if facts_added:
-            print(f"DEBUG: [{trace_id}] context_facts upsert session_id={session_id} added={facts_added}")
-
-        archives = context_store.get_archives(session_id)
-        if archives and ratio_before >= settings.CONTEXT_T3_THRESHOLD:
-            collapse_source = archives[: min(len(archives), 2)]
-            collapse_summary = _build_old_segment_summary(
-                session_id=session_id,
-                archives=collapse_source,
-                token_before=sum(archive.token_estimate for archive in collapse_source),
-            )
-            context_store.add_collapse_summary(session_id, collapse_summary)
-            layers.append("T3")
-            reason = "collapse_old_segments"
+            marker_ids.append(summary_id)
             print(
-                f"DEBUG: [{trace_id}] context_collapse generated "
-                f"session_id={session_id} template=old_segment_summary "
-                f"source_turns={len(collapse_summary.source_turn_ids)} "
-                f"summary_chars={len(collapse_summary.summary)}"
+                f"DEBUG: [{trace_id}] Context 原文扫描命中 summary_id "
+                f"session_id={session_id}, active_epoch={context_store.get_active_epoch(session_id)}, "
+                f"summary_id={summary_id}"
             )
-
-        should_t4 = ratio_before >= settings.CONTEXT_T4_THRESHOLD or (
-            settings.CONTEXT_DEMO_MODE and bool(archives)
-        )
-        if should_t4:
-            all_facts = context_store.get_facts(session_id)
-            collapse_summaries = context_store.get_collapse_summaries(session_id)
-            compact_summary = _build_nine_section_summary(
-                session_id=session_id,
-                messages=cleaned_history,
-                collapse_summaries=collapse_summaries,
-                facts=all_facts,
-                rag_context=rag_context,
-                token_before=tokens_before,
-            )
-            context_store.set_session_summary(session_id, compact_summary)
-            layers.append("T4")
-            reason = "compact_high_watermark" if ratio_before >= settings.CONTEXT_T4_THRESHOLD else "compact_demo_mode"
-            print(
-                f"DEBUG: [{trace_id}] context_compact generated "
-                f"session_id={session_id} template=odm_9_sections "
-                f"source_turns={len(compact_summary.source_turn_ids)} "
-                f"facts={len(all_facts)} summary_chars={len(compact_summary.summary)}"
-            )
-
-        context_note = _build_context_note(session_id)
-        compacted_messages = []
-        if context_note:
-            compacted_messages.append({"role": "system", "content": context_note})
-        compacted_messages.extend(recent_messages)
-        compacted_messages.append(question_message)
-
-        rag_context_out = rag_context
-        tokens_after = estimate_tokens(
-            "\n".join([system_prompt, rag_context_out, *[message["content"] for message in compacted_messages]])
-        )
-
-        if tokens_after >= settings.CONTEXT_BUDGET_TOKENS * settings.CONTEXT_T5_THRESHOLD:
-            layers.append("T5")
-            reason = "budget_exceeded"
-            target_chars = max(int(settings.CONTEXT_BUDGET_TOKENS * settings.CONTEXT_T5_THRESHOLD * 1.2), 480)
-            context_chars = max(int(target_chars * 0.35), 180)
-            rag_chars = max(int(target_chars * 0.25), 120)
-            message_chars = max(int(target_chars * 0.40), 180)
-
-            recent_messages = recent_messages[-4:]
-            per_message_chars = max(int(message_chars / max(len(recent_messages) + 1, 1)), 48)
-            recent_messages = [
-                {"role": message["role"], "content": _truncate_content(message["content"], per_message_chars)}
-                for message in recent_messages
-            ]
-            question_message = {
-                "role": "user",
-                "content": _truncate_content(question_message["content"], per_message_chars),
-            }
-            rag_context_out = _truncate_content(rag_context_out, rag_chars)
-            if context_note:
-                context_note = _truncate_content(context_note, context_chars)
-            compacted_messages = []
-            if context_note:
-                compacted_messages.append({"role": "system", "content": context_note})
-            compacted_messages.extend(recent_messages)
-            compacted_messages.append(question_message)
-            tokens_after = estimate_tokens(
-                "\n".join([system_prompt, rag_context_out, *[message["content"] for message in compacted_messages]])
-            )
-            if tokens_after >= settings.CONTEXT_BUDGET_TOKENS * settings.CONTEXT_T5_THRESHOLD:
-                recent_messages = recent_messages[-2:]
-                compacted_messages = [{"role": "user", "content": question_message["content"]}]
-                if context_note:
-                    compacted_messages.insert(0, {"role": "system", "content": _truncate_content(context_note, 180)})
-                rag_context_out = _truncate_content(rag_context_out, 120)
-                tokens_after = estimate_tokens(
-                    "\n".join([system_prompt, rag_context_out, *[message["content"] for message in compacted_messages]])
+            summary = context_store.get_summary(summary_id)
+            if summary:
+                log_mock_storage(
+                    target="redis",
+                    operation="read_summary",
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    summary_id=summary_id,
+                    detail=f"summary_type={summary.summary_type}",
                 )
-            print(
-                f"WARN: [{trace_id}] context_fallback applied "
-                f"session_id={session_id} layer=T5 reason=budget_exceeded "
-                f"history_out={len(recent_messages)} tokens_after={tokens_after}"
-            )
+                resolved_messages.append(_summary_message(summary))
+            else:
+                log_mock_storage(
+                    target="redis",
+                    operation="read_summary_fallback",
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    summary_id=summary_id,
+                    detail="summary_not_found_in_mock_store",
+                )
 
-        if len(layers) == 1 and tokens_before < settings.CONTEXT_BUDGET_TOKENS * settings.CONTEXT_T2_THRESHOLD:
-            print(
-                f"DEBUG: [{trace_id}] context_compact skip "
-                f"session_id={session_id} reason=under_budget "
-                f"history_in={len(cleaned_history)} history_out={len(compacted_messages)} "
-                f"tokens_before={tokens_before} tokens_after={tokens_after} "
-                f"ratio={ratio_before:.2f}"
-            )
-        else:
-            print(
-                f"DEBUG: [{trace_id}] context_compact applied "
-                f"session_id={session_id} layers={','.join(layers)} reason={reason} "
-                f"history_in={len(cleaned_history)} history_out={len(compacted_messages)} "
-                f"archived_turns={archived_turns} tokens_before={tokens_before} tokens_after={tokens_after}"
-            )
-
-        return ContextBuildResult(
-            messages=compacted_messages,
-            rag_context=rag_context_out,
+        print(
+            f"DEBUG: [{trace_id}] Context Read 完成 session_id={session_id}, "
+            f"active_epoch={context_store.get_active_epoch(session_id)}, "
+            f"raw_or_summary_messages={len(resolved_messages)}, marker_count={len(marker_ids)}"
+        )
+        return ContextReadResult(
+            messages=resolved_messages,
             stats={
                 "enabled": True,
                 "session_id": session_id,
-                "layers": layers,
-                "reason": reason,
-                "history_in": len(cleaned_history),
-                "history_out": len(compacted_messages),
+                "active_epoch": context_store.get_active_epoch(session_id),
                 "history_source": history_source,
                 "seeded_turns": seeded_turns,
-                "archived_turns": archived_turns,
+                "marker_ids": marker_ids,
+            },
+        )
+
+    def build_prompt(
+        self,
+        *,
+        context_read: ContextReadResult,
+        question: str,
+        rag_context: str,
+        system_prompt: str,
+        trace_id: str,
+    ) -> ContextBuildResult:
+        cleaned_question = _normalize_content(question)
+        messages = list(context_read.messages) + [{"role": "user", "content": cleaned_question}]
+        safe_budget = min(
+            int(settings.CONTEXT_BUDGET_TOKENS * settings.CONTEXT_PROMPT_SAFE_THRESHOLD),
+            max(settings.CONTEXT_BUDGET_TOKENS - settings.CONTEXT_OUTPUT_RESERVE_TOKENS, 1),
+        )
+
+        def prompt_tokens() -> int:
+            return estimate_tokens("\n".join([system_prompt, rag_context, *[message["content"] for message in messages]]))
+
+        tokens_before = prompt_tokens()
+        removed_history_messages = 0
+        while prompt_tokens() > safe_budget:
+            # Context Read preserves chronological order. Summary messages are compact
+            # substitutes for earlier history, so they are trimmed in that same order.
+            earliest_history_index = 0 if len(messages) > 1 else None
+            if earliest_history_index is None:
+                break
+            removed = messages.pop(earliest_history_index)
+            removed_history_messages += 1
+            fragment_type = "摘要片段" if removed["role"] == "system" else "原文片段"
+            print(
+                f"WARN: [{trace_id}] Context Prompt 临时裁剪最早历史{fragment_type} "
+                f"session_id={context_read.stats.get('session_id')}, role={removed['role']}, "
+                f"content_chars={len(removed['content'])}"
+            )
+
+        tokens_after = prompt_tokens()
+        print(
+            f"DEBUG: [{trace_id}] Prompt 总预算校验 session_id={context_read.stats.get('session_id')}, "
+            f"tokens_before={tokens_before}, tokens_after={tokens_after}, safe_budget={safe_budget}, "
+            f"removed_history_messages={removed_history_messages}"
+        )
+        return ContextBuildResult(
+            messages=messages,
+            rag_context=rag_context,
+            stats={
+                **context_read.stats,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
-                "ratio": ratio_before,
+                "safe_budget": safe_budget,
+                "removed_history_messages": removed_history_messages,
             },
+        )
+
+    def _govern_completed_history(self, *, session_id: str, trace_id: str) -> None:
+        active_turns = context_store.get_active_turns(session_id)
+        if not active_turns:
+            return
+
+        resolved_messages = self._resolve_governance_messages(session_id, active_turns)
+        tokens_before = estimate_tokens("\n".join(message["content"] for message in resolved_messages))
+        ratio_before = _safe_ratio(tokens_before)
+        layers: list[str] = []
+        active_epoch = context_store.get_active_epoch(session_id)
+
+        if ratio_before >= settings.CONTEXT_T1_THRESHOLD:
+            layers.append("T1")
+
+        raw_turns = [turn for turn in active_turns if not _summary_marker_id(turn.content)]
+        archive = None
+        max_recent_messages = max(settings.CONTEXT_RECENT_ROUNDS * 2, 2)
+        if ratio_before >= settings.CONTEXT_T2_THRESHOLD and len(raw_turns) > max_recent_messages:
+            old_turns = raw_turns[:-max_recent_messages]
+            archive = context_store.archive_turns(
+                session_id=session_id,
+                turns=old_turns,
+                keywords=_extract_keywords("\n".join(turn.content for turn in old_turns)),
+            )
+            if archive:
+                layers.append("T2")
+
+        if archive and ratio_before >= settings.CONTEXT_T3_THRESHOLD:
+            collapse_summary = _build_old_segment_summary(
+                session_id=session_id,
+                archives=[archive],
+                token_before=archive.token_estimate,
+            )
+            context_store.add_collapse_summary(session_id, collapse_summary)
+            context_store.replace_turns_with_summary_marker(
+                session_id=session_id,
+                turn_ids=archive.turn_ids,
+                summary_id=collapse_summary.summary_id,
+            )
+            layers.append("T3")
+            self._log_summary_persistence(
+                session_id=session_id,
+                trace_id=trace_id,
+                summary=collapse_summary,
+                layer="T3",
+            )
+
+        active_turns_after_t3 = context_store.get_active_turns(session_id)
+        resolved_after_t3 = self._resolve_governance_messages(session_id, active_turns_after_t3)
+        tokens_after_t3 = estimate_tokens("\n".join(message["content"] for message in resolved_after_t3))
+        ratio_after_t3 = _safe_ratio(tokens_after_t3)
+        should_t4 = ratio_after_t3 >= settings.CONTEXT_T4_THRESHOLD or (
+            settings.CONTEXT_DEMO_MODE and bool(context_store.get_archives(session_id))
+        )
+        compact_summary = None
+        if should_t4:
+            compact_summary = _build_nine_section_summary(
+                session_id=session_id,
+                messages=resolved_after_t3,
+                collapse_summaries=context_store.get_collapse_summaries(session_id),
+                facts=context_store.get_facts(session_id),
+                rag_context="",
+                token_before=tokens_after_t3,
+            )
+            context_store.set_session_summary(session_id, compact_summary)
+            context_store.replace_turns_with_summary_marker(
+                session_id=session_id,
+                turn_ids=[turn.turn_id for turn in active_turns_after_t3],
+                summary_id=compact_summary.summary_id,
+            )
+            layers.append("T4")
+            self._log_summary_persistence(
+                session_id=session_id,
+                trace_id=trace_id,
+                summary=compact_summary,
+                layer="T4",
+            )
+
+        active_turns_after_t4 = context_store.get_active_turns(session_id)
+        resolved_after_t4 = self._resolve_governance_messages(session_id, active_turns_after_t4)
+        ratio_after_t4 = _safe_ratio(
+            estimate_tokens("\n".join(message["content"] for message in resolved_after_t4))
+        )
+        if compact_summary and ratio_after_t4 >= settings.CONTEXT_T5_THRESHOLD:
+            old_epoch, new_epoch = context_store.rollover_epoch(session_id, compact_summary.summary_id)
+            layers.append("T5")
+            print(
+                f"DEBUG: [{trace_id}] Mock active_epoch 已切换 session_id={session_id}, "
+                f"from={old_epoch}, to={new_epoch}"
+            )
+
+        print(
+            f"DEBUG: [{trace_id}] Context T1/T2/T3/T4/T5 触发结果 "
+            f"session_id={session_id}, active_epoch={active_epoch}, layers={','.join(layers) or 'none'}, "
+            f"tokens_before={tokens_before}, ratio_before={ratio_before:.2f}"
+        )
+
+    def _resolve_governance_messages(
+        self,
+        session_id: str,
+        turns: list[ContextTurn],
+    ) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        for turn in turns:
+            summary_id = _summary_marker_id(turn.content)
+            if summary_id:
+                summary = context_store.get_summary(summary_id)
+                if summary:
+                    messages.append(_summary_message(summary))
+                continue
+            messages.append({"role": turn.role, "content": turn.content})
+        return messages
+
+    def _log_summary_persistence(
+        self,
+        *,
+        session_id: str,
+        trace_id: str,
+        summary: SummaryRecord,
+        layer: str,
+    ) -> None:
+        log_mock_storage(
+            target="postgresql",
+            operation="persist_context_summary",
+            session_id=session_id,
+            trace_id=trace_id,
+            summary_id=summary.summary_id,
+            detail=f"summary_type={layer}, summary_chars={len(summary.summary)}",
+        )
+        print(
+            f"DEBUG: [{trace_id}] 已落入 Mock PostgreSQL 摘要表 "
+            f"summary_id={summary.summary_id}, layer={layer}"
+        )
+        log_mock_storage(
+            target="redis",
+            operation="cache_context_summary",
+            session_id=session_id,
+            trace_id=trace_id,
+            summary_id=summary.summary_id,
+            detail=f"summary_type={layer}, summary_chars={len(summary.summary)}",
         )
 
 context_manager = ContextManager()

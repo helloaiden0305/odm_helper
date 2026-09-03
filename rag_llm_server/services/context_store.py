@@ -87,6 +87,8 @@ class InMemoryContextStore:
     collapsed_summaries: dict[str, list[SummaryRecord]] = field(default_factory=dict)
     session_summary: dict[str, SummaryRecord] = field(default_factory=dict)
     session_facts: dict[str, list[FactRecord]] = field(default_factory=dict)
+    summary_by_id: dict[str, SummaryRecord] = field(default_factory=dict)
+    active_epochs: dict[str, str] = field(default_factory=dict)
     archived_signatures: dict[str, set[str]] = field(default_factory=dict)
     fact_signatures: dict[str, set[str]] = field(default_factory=dict)
     turn_seq: dict[str, int] = field(default_factory=dict)
@@ -114,6 +116,9 @@ class InMemoryContextStore:
 
     def get_active_turns(self, session_id: str) -> list[ContextTurn]:
         return list(self.active_turns.get(session_id, []))
+
+    def get_active_epoch(self, session_id: str) -> str:
+        return self.active_epochs.setdefault(session_id, "epoch_001")
 
     def append_active_turns(self, session_id: str, turns: list[ContextTurn]) -> int:
         """Append completed turns to the canonical history for one conversation."""
@@ -209,15 +214,75 @@ class InMemoryContextStore:
 
     def add_collapse_summary(self, session_id: str, summary: SummaryRecord) -> None:
         self.collapsed_summaries.setdefault(session_id, []).append(summary)
+        self.summary_by_id[summary.summary_id] = summary
 
     def get_collapse_summaries(self, session_id: str) -> list[SummaryRecord]:
         return list(self.collapsed_summaries.get(session_id, []))
 
     def set_session_summary(self, session_id: str, summary: SummaryRecord) -> None:
         self.session_summary[session_id] = summary
+        self.summary_by_id[summary.summary_id] = summary
 
     def get_session_summary(self, session_id: str) -> SummaryRecord | None:
         return self.session_summary.get(session_id)
+
+    def get_summary(self, summary_id: str) -> SummaryRecord | None:
+        return self.summary_by_id.get(summary_id)
+
+    def replace_turns_with_summary_marker(
+        self,
+        session_id: str,
+        turn_ids: list[str],
+        summary_id: str,
+    ) -> bool:
+        """Replace one old working-context segment with a summary marker.
+
+        The source turns remain available in conversation and archive records; only
+        the active prompt representation is replaced.
+        """
+        target_ids = set(turn_ids)
+        if not target_ids:
+            return False
+
+        turns = self.active_turns.get(session_id, [])
+        first_index = next((index for index, turn in enumerate(turns) if turn.turn_id in target_ids), None)
+        if first_index is None:
+            return False
+
+        marker = ContextTurn(
+            turn_id=f"marker_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
+            role="system",
+            content=f"[[summary_id:{summary_id}]]",
+            created_at=now_iso(),
+            token_estimate=estimate_token_count(summary_id),
+            signature=message_signature("system", summary_id),
+        )
+        retained = [turn for turn in turns if turn.turn_id not in target_ids]
+        retained.insert(first_index, marker)
+        self.active_turns[session_id] = retained
+        return True
+
+    def rollover_epoch(self, session_id: str, summary_id: str) -> tuple[str, str]:
+        current_epoch = self.get_active_epoch(session_id)
+        try:
+            next_number = int(current_epoch.rsplit("_", 1)[-1]) + 1
+        except ValueError:
+            next_number = 2
+        next_epoch = f"epoch_{next_number:03d}"
+        self.active_epochs[session_id] = next_epoch
+        self.active_turns[session_id] = [
+            ContextTurn(
+                turn_id=f"marker_{uuid.uuid4().hex[:8]}",
+                session_id=session_id,
+                role="system",
+                content=f"[[summary_id:{summary_id}]]",
+                created_at=now_iso(),
+                token_estimate=estimate_token_count(summary_id),
+                signature=message_signature("system", summary_id),
+            )
+        ]
+        return current_epoch, next_epoch
 
     def upsert_facts(self, session_id: str, facts: list[FactRecord]) -> int:
         if not facts:

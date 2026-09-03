@@ -25,6 +25,10 @@ class Config:
 
     CONTEXT_MANAGER_ENABLED = os.getenv("CONTEXT_MANAGER_ENABLED", "true").lower() == "true"
     CONTEXT_BUDGET_TOKENS = int(os.getenv("CONTEXT_BUDGET_TOKENS", "6000"))
+    CONTEXT_MAX_INPUT_TOKENS = int(os.getenv("CONTEXT_MAX_INPUT_TOKENS", "750"))
+    CONTEXT_OUTPUT_RESERVE_TOKENS = int(os.getenv("CONTEXT_OUTPUT_RESERVE_TOKENS", "800"))
+    CONTEXT_PROMPT_SAFE_THRESHOLD = float(os.getenv("CONTEXT_PROMPT_SAFE_THRESHOLD", "0.90"))
+    CONTEXT_T1_THRESHOLD = float(os.getenv("CONTEXT_T1_THRESHOLD", "0.30"))
     CONTEXT_T2_THRESHOLD = float(os.getenv("CONTEXT_T2_THRESHOLD", "0.50"))
     CONTEXT_T3_THRESHOLD = float(os.getenv("CONTEXT_T3_THRESHOLD", "0.75"))
     CONTEXT_T4_THRESHOLD = float(os.getenv("CONTEXT_T4_THRESHOLD", "0.90"))
@@ -33,6 +37,7 @@ class Config:
     CONTEXT_MAX_MESSAGE_CHARS = int(os.getenv("CONTEXT_MAX_MESSAGE_CHARS", "1200"))
     CONTEXT_SESSION_ID = os.getenv("CONTEXT_SESSION_ID", "text_default")
     CONTEXT_DEMO_MODE = os.getenv("CONTEXT_DEMO_MODE", "false").lower() == "true"
+    CONTEXT_SUMMARY_CACHE_TTL_SECONDS = int(os.getenv("CONTEXT_SUMMARY_CACHE_TTL_SECONDS", "1800"))
     
     SERVER_URL = os.getenv("SERVER_URL")
 
