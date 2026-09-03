@@ -169,6 +169,10 @@ def _to_turns(session_id: str, messages: list[dict[str, str]]) -> list[ContextTu
     return turns
 
 
+def _turns_to_messages(turns: list[ContextTurn]) -> list[dict[str, str]]:
+    return [{"role": turn.role, "content": turn.content} for turn in turns]
+
+
 def _build_fact(session_id: str, source_turn_id: str, key: str, value: str) -> FactRecord:
     return FactRecord(
         fact_id=f"fact_{uuid.uuid4().hex[:8]}",
@@ -336,12 +340,66 @@ def _build_context_note(session_id: str) -> str:
 
 
 class ContextManager:
+    def begin_turn(self, *, session_id: str, question: str, channel: str, trace_id: str) -> str:
+        if not settings.CONTEXT_MANAGER_ENABLED:
+            return ""
+
+        cleaned_question = _truncate_content(
+            _normalize_content(question),
+            settings.CONTEXT_MAX_MESSAGE_CHARS,
+        )
+        if not cleaned_question:
+            return ""
+
+        turn_id = context_store.begin_turn(
+            session_id=session_id,
+            question=cleaned_question,
+            channel=channel,
+        )
+        print(
+            f"DEBUG: [{trace_id}] context_turn pending "
+            f"session_id={session_id} turn_id={turn_id} channel={channel} "
+            f"question_len={len(cleaned_question)}"
+        )
+        return turn_id
+
+    def complete_turn(self, *, session_id: str, turn_id: str, answer: str, trace_id: str) -> None:
+        if not settings.CONTEXT_MANAGER_ENABLED or not turn_id:
+            return
+
+        cleaned_answer = _truncate_content(
+            _normalize_content(answer),
+            settings.CONTEXT_MAX_MESSAGE_CHARS,
+        )
+        completed_turns = context_store.complete_turn(session_id, turn_id, cleaned_answer)
+        if not completed_turns:
+            return
+
+        facts_added = context_store.upsert_facts(session_id, _extract_facts(session_id, completed_turns))
+        output_tokens = estimate_tokens(cleaned_answer)
+        print(
+            f"DEBUG: [{trace_id}] context_turn completed "
+            f"session_id={session_id} turn_id={turn_id} answer_chars={len(cleaned_answer)} "
+            f"answer_tokens={output_tokens} facts_added={facts_added}"
+        )
+
+    def close_turn(self, *, session_id: str, turn_id: str, status: str, trace_id: str) -> None:
+        if not settings.CONTEXT_MANAGER_ENABLED or not turn_id:
+            return
+
+        if context_store.close_turn(session_id, turn_id, status):
+            print(
+                f"DEBUG: [{trace_id}] context_turn {status} "
+                f"session_id={session_id} turn_id={turn_id}"
+            )
+
     def build_context(
         self,
         *,
         session_id: str,
         history: list[dict[str, Any]],
         question: str,
+        turn_id: str = "",
         rag_context: str,
         trace_id: str,
         system_prompt: str = "",
@@ -350,9 +408,57 @@ class ContextManager:
             messages = _clean_messages(history) + [{"role": "user", "content": question}]
             return ContextBuildResult(messages=messages, rag_context=rag_context, stats={"enabled": False})
 
-        cleaned_history = _clean_messages(history)
+        incoming_history = _clean_messages(history)
         cleaned_question = _truncate_content(_normalize_content(question), settings.CONTEXT_MAX_MESSAGE_CHARS)
-        question_message = {"role": "user", "content": cleaned_question}
+        stored_current_turn = next(
+            (
+                turn
+                for turn in context_store.get_active_turns(session_id)
+                if turn.turn_id == turn_id and turn.role == "user"
+            ),
+            None,
+        )
+        if stored_current_turn and stored_current_turn.content != cleaned_question:
+            stored_current_turn = None
+
+        active_history_turns = [
+            turn
+            for turn in context_store.get_active_turns(session_id)
+            if not stored_current_turn or turn.turn_id != stored_current_turn.turn_id
+        ]
+        seeded_turns = 0
+        history_source = "store"
+        if not active_history_turns and incoming_history:
+            seeded_turns = len(incoming_history)
+            seeded_history_turns = _to_turns(session_id, incoming_history)
+            if stored_current_turn:
+                seeded_history_turns.append(stored_current_turn)
+            context_store.set_active_turns(
+                session_id,
+                seeded_history_turns,
+            )
+            active_history_turns = [
+                turn
+                for turn in context_store.get_active_turns(session_id)
+                if not stored_current_turn or turn.turn_id != stored_current_turn.turn_id
+            ]
+            history_source = "input_seed"
+            print(
+                f"DEBUG: [{trace_id}] context_history seeded "
+                f"session_id={session_id} turns={seeded_turns}"
+            )
+        elif incoming_history:
+            print(
+                f"DEBUG: [{trace_id}] context_history use_store "
+                f"session_id={session_id} ignored_carrier_messages={len(incoming_history)}"
+            )
+
+        cleaned_history = _turns_to_messages(active_history_turns)
+        question_message = (
+            {"role": stored_current_turn.role, "content": stored_current_turn.content}
+            if stored_current_turn
+            else {"role": "user", "content": cleaned_question}
+        )
         all_messages = cleaned_history + [question_message]
         tokens_before = estimate_tokens(
             "\n".join([system_prompt, rag_context, *[message["content"] for message in all_messages]])
@@ -373,22 +479,29 @@ class ContextManager:
         recent_messages = cleaned_history
         archived_turns = 0
 
+        recent_history_turns = active_history_turns
         if should_t2 and len(cleaned_history) > max_recent_messages:
             old_messages = cleaned_history[:-max_recent_messages]
             recent_messages = cleaned_history[-max_recent_messages:]
-            old_turns = _to_turns(session_id, old_messages)
+            old_turns = active_history_turns[:-max_recent_messages]
+            recent_history_turns = active_history_turns[-max_recent_messages:]
             archive = context_store.archive_turns(
                 session_id=session_id,
                 turns=old_turns,
                 keywords=_extract_keywords("\n".join(message["content"] for message in old_messages)),
             )
             archived_turns = len(archive.turn_ids) if archive else 0
+            context_store.set_active_turns(
+                session_id,
+                recent_history_turns + ([stored_current_turn] if stored_current_turn else []),
+            )
             layers.append("T2")
             reason = "recent_rounds_exceeded"
 
-        current_turns = _to_turns(session_id, recent_messages + [question_message])
-        context_store.set_active_turns(session_id, current_turns)
-        facts_added = context_store.upsert_facts(session_id, _extract_facts(session_id, current_turns))
+        facts_added = context_store.upsert_facts(
+            session_id,
+            _extract_facts(session_id, recent_history_turns),
+        )
         if facts_added:
             print(f"DEBUG: [{trace_id}] context_facts upsert session_id={session_id} added={facts_added}")
 
@@ -418,7 +531,7 @@ class ContextManager:
             collapse_summaries = context_store.get_collapse_summaries(session_id)
             compact_summary = _build_nine_section_summary(
                 session_id=session_id,
-                messages=all_messages,
+                messages=cleaned_history,
                 collapse_summaries=collapse_summaries,
                 facts=all_facts,
                 rag_context=rag_context,
@@ -516,31 +629,13 @@ class ContextManager:
                 "reason": reason,
                 "history_in": len(cleaned_history),
                 "history_out": len(compacted_messages),
+                "history_source": history_source,
+                "seeded_turns": seeded_turns,
                 "archived_turns": archived_turns,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
                 "ratio": ratio_before,
             },
         )
-
-    def record_exchange(self, *, session_id: str, question: str, answer: str, trace_id: str) -> None:
-        if not settings.CONTEXT_MANAGER_ENABLED or not answer:
-            return
-
-        messages = _clean_messages(
-            [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": answer},
-            ]
-        )
-        turns = _to_turns(session_id, messages)
-        facts_added = context_store.upsert_facts(session_id, _extract_facts(session_id, turns))
-        output_tokens = estimate_tokens(answer)
-        print(
-            f"DEBUG: [{trace_id}] context_output observed "
-            f"session_id={session_id} answer_chars={len(answer)} "
-            f"answer_tokens={output_tokens} facts_added={facts_added}"
-        )
-
 
 context_manager = ContextManager()

@@ -12,6 +12,7 @@ export const UserAgreement = 'https://www.volcengine.com/docs/6348/128955';
  *       动态使用当前页面的主机名，支持局域网访问
  */
 export const AIGC_PROXY_HOST = `http://${window.location.hostname}:3001`;
+export const CONTEXT_CONVERSATION_STORAGE_KEY = 'xzy_odm_conversation_id';
 
 export interface IScene {
   icon: string;

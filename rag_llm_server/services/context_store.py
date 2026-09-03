@@ -1,4 +1,5 @@
 import hashlib
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +15,10 @@ def message_signature(role: str, content: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def estimate_token_count(content: str) -> int:
+    return math.ceil(len(content or "") / 1.6)
+
+
 @dataclass
 class ContextTurn:
     turn_id: str
@@ -23,6 +28,20 @@ class ContextTurn:
     created_at: str
     token_estimate: int
     signature: str
+
+
+@dataclass
+class ConversationTurn:
+    """Lifecycle metadata for one user question and its eventual assistant answer."""
+
+    turn_id: str
+    session_id: str
+    channel: str
+    question: str
+    status: str
+    created_at: str
+    completed_at: str | None = None
+    assistant_turn_id: str | None = None
 
 
 @dataclass
@@ -63,6 +82,7 @@ class FactRecord:
 @dataclass
 class InMemoryContextStore:
     active_turns: dict[str, list[ContextTurn]] = field(default_factory=dict)
+    conversation_turns: dict[str, dict[str, ConversationTurn]] = field(default_factory=dict)
     archived_messages: dict[str, list[ArchiveRecord]] = field(default_factory=dict)
     collapsed_summaries: dict[str, list[SummaryRecord]] = field(default_factory=dict)
     session_summary: dict[str, SummaryRecord] = field(default_factory=dict)
@@ -91,6 +111,74 @@ class InMemoryContextStore:
 
     def set_active_turns(self, session_id: str, turns: list[ContextTurn]) -> None:
         self.active_turns[session_id] = turns
+
+    def get_active_turns(self, session_id: str) -> list[ContextTurn]:
+        return list(self.active_turns.get(session_id, []))
+
+    def append_active_turns(self, session_id: str, turns: list[ContextTurn]) -> int:
+        """Append completed turns to the canonical history for one conversation."""
+        if not turns:
+            return 0
+
+        active_turns = self.active_turns.setdefault(session_id, [])
+        active_turns.extend(turns)
+        return len(turns)
+
+    def begin_turn(self, session_id: str, question: str, channel: str) -> str:
+        user_turn = self.build_turn(
+            session_id=session_id,
+            message={"role": "user", "content": question},
+            token_estimate=estimate_token_count(question),
+        )
+        self.active_turns.setdefault(session_id, []).append(user_turn)
+        self.conversation_turns.setdefault(session_id, {})[user_turn.turn_id] = ConversationTurn(
+            turn_id=user_turn.turn_id,
+            session_id=session_id,
+            channel=channel,
+            question=question,
+            status="pending",
+            created_at=user_turn.created_at,
+        )
+        return user_turn.turn_id
+
+    def get_conversation_turn(self, session_id: str, turn_id: str) -> ConversationTurn | None:
+        return self.conversation_turns.get(session_id, {}).get(turn_id)
+
+    def complete_turn(self, session_id: str, turn_id: str, answer: str) -> list[ContextTurn]:
+        record = self.get_conversation_turn(session_id, turn_id)
+        if not record or record.status != "pending" or not answer:
+            return []
+
+        active_turns = self.active_turns.get(session_id, [])
+        user_turn = next((turn for turn in active_turns if turn.turn_id == turn_id), None)
+        if not user_turn:
+            return []
+
+        assistant_turn = self.build_turn(
+            session_id=session_id,
+            message={"role": "assistant", "content": answer},
+            token_estimate=estimate_token_count(answer),
+        )
+        active_turns.append(assistant_turn)
+        record.status = "completed"
+        record.completed_at = now_iso()
+        record.assistant_turn_id = assistant_turn.turn_id
+        return [user_turn, assistant_turn]
+
+    def close_turn(self, session_id: str, turn_id: str, status: str) -> bool:
+        if status not in {"failed", "interrupted"}:
+            raise ValueError(f"Unsupported turn status: {status}")
+
+        record = self.get_conversation_turn(session_id, turn_id)
+        if not record or record.status != "pending":
+            return False
+
+        record.status = status
+        record.completed_at = now_iso()
+        self.active_turns[session_id] = [
+            turn for turn in self.active_turns.get(session_id, []) if turn.turn_id != turn_id
+        ]
+        return True
 
     def archive_turns(self, session_id: str, turns: list[ContextTurn], keywords: list[str]) -> ArchiveRecord | None:
         if not turns:

@@ -27,6 +27,7 @@ import VERTC, {
 import RTCAIAnsExtension from '@volcengine/rtc/extension-ainr';
 import { Message } from '@arco-design/web-react';
 import Apis from '@/app/index';
+import { CONTEXT_CONVERSATION_STORAGE_KEY } from '@/config';
 import { string2tlv } from '@/utils/utils';
 import { COMMAND, INTERRUPT_PRIORITY } from '@/utils/handler';
 
@@ -386,6 +387,7 @@ export class RTCClient {
       SceneID: scene,
       RoomId: this.basicInfo.room_id,
       UserId: this.basicInfo.user_id,
+      ConversationId: sessionStorage.getItem(CONTEXT_CONVERSATION_STORAGE_KEY) || undefined,
     });
     this.audioBotEnabled = true;
     this.audioBotStartTime = Date.now();

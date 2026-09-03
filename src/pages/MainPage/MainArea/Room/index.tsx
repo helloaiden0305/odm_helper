@@ -19,7 +19,7 @@ import UserTag from '@/components/UserTag';
 import FullScreenCard from '@/components/FullScreenCard';
 import MobileToolBar from '@/pages/Mobile/MobileToolBar';
 import { useScene } from '@/lib/useCommon';
-import { AIGC_PROXY_HOST } from '@/config';
+import { AIGC_PROXY_HOST, CONTEXT_CONVERSATION_STORAGE_KEY } from '@/config';
 import RtcClient from '@/lib/RtcClient';
 import { COMMAND, INTERRUPT_PRIORITY } from '@/utils/handler';
 
@@ -78,6 +78,17 @@ const wait = (duration: number) =>
     window.setTimeout(resolve, duration);
   });
 
+const getOrCreateConversationId = () => {
+  const existingId = window.sessionStorage.getItem(CONTEXT_CONVERSATION_STORAGE_KEY);
+  if (existingId) {
+    return existingId;
+  }
+
+  const generatedId = `conv_${window.crypto?.randomUUID?.() || `${Date.now()}_${Math.random()}`}`;
+  window.sessionStorage.setItem(CONTEXT_CONVERSATION_STORAGE_KEY, generatedId);
+  return generatedId;
+};
+
 function Room() {
   const room = useSelector((state: RootState) => state.room);
   const { isShowSubtitle, scene, isFullScreen } = room;
@@ -91,6 +102,10 @@ function Room() {
   );
   const voicePreviewMapRef = useRef<Record<string, VoicePreviewState>>({});
   const confirmedVoiceLoadingIdRef = useRef<string | null>(null);
+  const conversationIdRef = useRef('');
+  if (!conversationIdRef.current) {
+    conversationIdRef.current = getOrCreateConversationId();
+  }
   const [textMessages, setTextMessages] = useState<TextChatMessage[]>(() => [
     {
       id: 'text-mode-welcome',
@@ -376,6 +391,7 @@ function Room() {
         body: JSON.stringify({
           question,
           history: textHistory,
+          session_id: conversationIdRef.current,
         }),
       });
 

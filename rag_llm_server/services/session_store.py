@@ -6,6 +6,7 @@ class InMemorySessionStore:
     """Demo session store. Replace with Redis/DB for multi-instance deployment."""
 
     task_ids: dict[str, str] = field(default_factory=dict)
+    conversation_ids: dict[str, str] = field(default_factory=dict)
 
     @staticmethod
     def build_key(room_id: str, user_id: str) -> str:
@@ -19,6 +20,13 @@ class InMemorySessionStore:
     def pop_task_id(self, room_id: str, user_id: str, default_task_id: str) -> str:
         session_key = self.build_key(room_id, user_id)
         return self.task_ids.pop(session_key, default_task_id)
+
+    def set_conversation_id(self, room_id: str, user_id: str, conversation_id: str) -> None:
+        if conversation_id:
+            self.conversation_ids[self.build_key(room_id, user_id)] = conversation_id
+
+    def get_conversation_id(self, room_id: str, user_id: str) -> str:
+        return self.conversation_ids.get(self.build_key(room_id, user_id), "")
 
 
 session_store = InMemorySessionStore()

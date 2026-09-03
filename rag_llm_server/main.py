@@ -6,6 +6,7 @@ import hashlib
 import httpx
 import struct
 import uvicorn
+from dataclasses import dataclass
 from urllib.parse import urlencode
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,7 +43,15 @@ DEFAULT_TASK_ID = "XzyDemoTask"
 CONFIRMED_VOICE_QUESTION_TTL_SECONDS = 30
 
 voice_text_clients: Dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
-confirmed_voice_questions: Dict[str, dict[str, float]] = {}
+
+
+@dataclass
+class ConfirmedVoiceQuestion:
+    expires_at: float
+    turn_id: str
+
+
+confirmed_voice_questions: Dict[str, dict[str, ConfirmedVoiceQuestion]] = {}
 
 
 def build_session_key(room_id: str, user_id: str) -> str:
@@ -63,29 +72,29 @@ def voice_question_key(question: str) -> str:
     return hashlib.sha256(normalize_voice_question(question).encode("utf-8")).hexdigest()
 
 
-def consume_confirmed_voice_question(session_key: str, question: str) -> bool:
+def consume_confirmed_voice_question(session_key: str, question: str) -> str:
     if not session_key or not question:
-        return False
+        return ""
 
     question_hash = voice_question_key(question)
     session_questions = confirmed_voice_questions.get(session_key)
     if not session_questions:
-        return False
+        return ""
 
     now = time.time()
-    for key, expires_at in list(session_questions.items()):
-        if expires_at < now:
+    for key, confirmed_question in list(session_questions.items()):
+        if confirmed_question.expires_at < now:
             session_questions.pop(key, None)
 
     if question_hash not in session_questions:
         if not session_questions:
             confirmed_voice_questions.pop(session_key, None)
-        return False
+        return ""
 
-    session_questions.pop(question_hash, None)
+    confirmed_question = session_questions.pop(question_hash)
     if not session_questions:
         confirmed_voice_questions.pop(session_key, None)
-    return True
+    return confirmed_question.turn_id
 
 
 def _read_uint16(buffer: bytes, offset: int) -> tuple[int, int]:
@@ -296,6 +305,7 @@ async def proxy(request: Request):
     target_app_id = settings.RTC_APP_ID or "your_rtc_app_id"
     target_room_id = incoming_body.get("RoomId") or settings.RTC_ROOM_ID or DEFAULT_ROOM_ID
     target_user_id = incoming_body.get("UserId") or settings.RTC_USER_ID or DEFAULT_USER_ID
+    conversation_id = str(incoming_body.get("ConversationId") or "").strip()
 
     request_body = {}
 
@@ -306,7 +316,12 @@ async def proxy(request: Request):
     if action == "StartVoiceChat":
         active_task_id = f"{DEFAULT_TASK_ID}-{uuid.uuid4().hex[:8]}"
         session_key = session_store.set_task_id(target_room_id, target_user_id, active_task_id)
+        session_store.set_conversation_id(target_room_id, target_user_id, conversation_id)
         print(f"DEBUG: [{trace_id}] Session task stored key={session_key}, task_id={active_task_id}")
+        print(
+            f"DEBUG: [{trace_id}] Context conversation bound "
+            f"key={session_key}, conversation_id={conversation_id or 'voice_fallback'}"
+        )
         request_body = {
             "AppId": target_app_id,
             "RoomId": target_room_id,
@@ -451,6 +466,8 @@ async def chat_callback(request: Request):
     room_id = request.query_params.get("room_id", "")
     user_id = request.query_params.get("user_id", "")
     session_key = build_session_key(room_id, user_id) if room_id and user_id else ""
+    conversation_id = session_store.get_conversation_id(room_id, user_id) if session_key else ""
+    context_session_id = conversation_id or (f"voice:{session_key}" if session_key else "voice_default")
     preview_id = uuid.uuid4().hex[:8]
 
     # 校验逻辑 (保持不变)
@@ -459,8 +476,9 @@ async def chat_callback(request: Request):
         return {"text": ""}
 
     latest_user_text = (messages[-1].get("content") or "").strip()
-    is_confirmed_voice_question = consume_confirmed_voice_question(session_key, latest_user_text)
-    if settings.VOICE_CONFIRM_MODE and session_key and latest_user_text != "欢迎语" and not is_confirmed_voice_question:
+    is_welcome_message = latest_user_text == "欢迎语"
+    voice_turn_id = consume_confirmed_voice_question(session_key, latest_user_text)
+    if settings.VOICE_CONFIRM_MODE and session_key and not is_welcome_message and not voice_turn_id:
         print(
             f"DEBUG: 语音待确认 preview_id={preview_id}, "
             f"session={session_key}, text_len={len(latest_user_text)}"
@@ -485,14 +503,36 @@ async def chat_callback(request: Request):
             },
         )
 
+    if not voice_turn_id and not is_welcome_message:
+        voice_turn_id = context_manager.begin_turn(
+            session_id=context_session_id,
+            question=latest_user_text,
+            channel="voice",
+            trace_id=preview_id,
+        )
+
     # --- 定义 SSE 生成器 ---
     async def generate_sse():
         preview_started = False
+        answer_parts: list[str] = []
+        stream_succeeded = False
 
         try:
-            rag_content = await rag_service.retrieve(messages[-1].get("content", ""))
+            rag_content = await rag_service.retrieve(latest_user_text)
+            context_result = context_manager.build_context(
+                session_id=context_session_id,
+                history=messages[:-1],
+                question=latest_user_text,
+                turn_id=voice_turn_id,
+                rag_context=rag_content,
+                trace_id=preview_id,
+                system_prompt=SYSTEM_PROMPT,
+            )
 
-            stream_iterator = llm_service.chat_stream(messages, rag_content)
+            stream_iterator = llm_service.chat_stream(
+                context_result.messages,
+                context_result.rag_context,
+            )
             if session_key:
                 await publish_voice_text_event(
                     session_key,
@@ -510,12 +550,23 @@ async def chat_callback(request: Request):
                         delta = choices[0].delta
                         content = getattr(delta, "content", None)
                         if content:
+                            answer_parts.append(content)
                             await publish_voice_text_event(
                                 session_key,
                                 {"type": "delta", "id": preview_id, "content": content},
                             )
 
                     yield f"data: {chunk_json}\n\n"
+            stream_succeeded = bool(answer_parts)
+        except asyncio.CancelledError:
+            if voice_turn_id:
+                context_manager.close_turn(
+                    session_id=context_session_id,
+                    turn_id=voice_turn_id,
+                    status="interrupted",
+                    trace_id=preview_id,
+                )
+            raise
         except Exception as exc:
             print(f"ERROR: 语音回调流式输出失败 preview_id={preview_id}: {exc}")
             if session_key and preview_started:
@@ -524,6 +575,23 @@ async def chat_callback(request: Request):
                     {"type": "error", "id": preview_id, "content": "助手暂时没有返回，请稍后重试。"},
                 )
         finally:
+            try:
+                if voice_turn_id and stream_succeeded:
+                    context_manager.complete_turn(
+                        session_id=context_session_id,
+                        turn_id=voice_turn_id,
+                        answer="".join(answer_parts),
+                        trace_id=preview_id,
+                    )
+                elif voice_turn_id:
+                    context_manager.close_turn(
+                        session_id=context_session_id,
+                        turn_id=voice_turn_id,
+                        status="failed",
+                        trace_id=preview_id,
+                    )
+            except Exception as exc:
+                print(f"WARN: 语音上下文状态回填失败 preview_id={preview_id}: {exc}")
             if session_key and preview_started:
                 await publish_voice_text_event(session_key, {"type": "end", "id": preview_id})
         yield "data: [DONE]\n\n"
@@ -572,10 +640,24 @@ async def confirm_voice_question(request: ConfirmVoiceQuestionRequest):
         )
 
     session_key = build_session_key(request.room_id, request.user_id)
+    conversation_id = session_store.get_conversation_id(request.room_id, request.user_id)
+    context_session_id = conversation_id or f"voice:{session_key}"
+    trace_id = uuid.uuid4().hex[:8]
+    turn_id = context_manager.begin_turn(
+        session_id=context_session_id,
+        question=question,
+        channel="voice",
+        trace_id=trace_id,
+    )
+    confirmation_turn_id = turn_id or f"confirm_{uuid.uuid4().hex[:8]}"
     session_questions = confirmed_voice_questions.setdefault(session_key, {})
-    session_questions[voice_question_key(question)] = time.time() + CONFIRMED_VOICE_QUESTION_TTL_SECONDS
+    session_questions[voice_question_key(question)] = ConfirmedVoiceQuestion(
+        expires_at=time.time() + CONFIRMED_VOICE_QUESTION_TTL_SECONDS,
+        turn_id=confirmation_turn_id,
+    )
     print(
         f"DEBUG: 语音问题确认登记 session={session_key}, "
+        f"context_session_id={context_session_id}, turn_id={turn_id}, "
         f"text_len={len(question)}, pending_count={len(session_questions)}"
     )
     return {"ok": True}
@@ -622,15 +704,23 @@ async def text_chat_stream(request: DebugRequest):
 
     request_start = time.time()
     session_id = request.session_id or settings.CONTEXT_SESSION_ID
+    turn_id = context_manager.begin_turn(
+        session_id=session_id,
+        question=question,
+        channel="text",
+        trace_id=trace_id,
+    )
     print(
         f"DEBUG: [{trace_id}] 文字流式请求开始 "
-        f"session_id={session_id}, question_len={len(question)}, history_count={len(request.history or [])}"
+        f"session_id={session_id}, turn_id={turn_id}, question_len={len(question)}, "
+        f"history_count={len(request.history or [])}"
     )
 
     async def generate_text_stream():
         output_chars = 0
         first_chunk_sent = False
         answer_parts: list[str] = []
+        stream_succeeded = False
 
         try:
             rag_start = time.time()
@@ -642,6 +732,7 @@ async def text_chat_stream(request: DebugRequest):
                 session_id=session_id,
                 history=history_messages,
                 question=question,
+                turn_id=turn_id,
                 rag_context=rag_content,
                 trace_id=trace_id,
                 system_prompt=SYSTEM_PROMPT,
@@ -666,16 +757,34 @@ async def text_chat_stream(request: DebugRequest):
                 output_chars += len(content)
                 answer_parts.append(content)
                 yield content
+            stream_succeeded = bool(answer_parts)
+        except asyncio.CancelledError:
+            if turn_id:
+                context_manager.close_turn(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    status="interrupted",
+                    trace_id=trace_id,
+                )
+            raise
         except Exception as exc:
             print(f"ERROR: [{trace_id}] 文字流式输出失败: {exc}")
             yield "助手暂时没有返回，请稍后重试。"
         finally:
-            context_manager.record_exchange(
-                session_id=session_id,
-                question=question,
-                answer="".join(answer_parts),
-                trace_id=trace_id,
-            )
+            if turn_id and stream_succeeded:
+                context_manager.complete_turn(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    answer="".join(answer_parts),
+                    trace_id=trace_id,
+                )
+            elif turn_id:
+                context_manager.close_turn(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    status="failed",
+                    trace_id=trace_id,
+                )
             total_duration = time.time() - request_start
             print(
                 f"DEBUG: [{trace_id}] 文字流式请求结束 "
